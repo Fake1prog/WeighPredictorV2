@@ -14,6 +14,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from train_weight_model import FoodWeightCNN
+import boto3
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -316,7 +317,7 @@ def detect_food(image_path):
                         # Format: [x1, y1, x2, y2, ...]
                         for i in range(0, len(prediction["points"]), 2):
                             x = int(prediction["points"][i] * scale_x)
-                            y = int(prediction["points"][i+1] * scale_y)
+                            y = int(prediction["points"][i + 1] * scale_y)
                             polygon_points.append((x, y))
 
                 # Convert to numpy array for OpenCV
@@ -359,14 +360,14 @@ def detect_food(image_path):
                 height = int(height * scale_y)
 
                 # Ensure coordinates are within image bounds
-                x = max(0, min(x, orig_width-1))
-                y = max(0, min(y, orig_height-1))
+                x = max(0, min(x, orig_width - 1))
+                y = max(0, min(y, orig_height - 1))
                 width = min(width, orig_width - x)
                 height = min(height, orig_height - y)
 
                 # Create mask from bounding box
                 mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
-                mask[y:y+height, x:x+width] = 255
+                mask[y:y + height, x:x + width] = 255
 
             if mask is None:
                 print(f"Failed to create mask for {class_name}")
@@ -765,7 +766,8 @@ def api_analyze():
             'components': {},
             'images': {
                 'original': f"{server_url}/static/uploads/{filename}",
-                'detection': f"{server_url}/static/{detection_result.get('visualization')}" if detection_result.get('visualization') else None,
+                'detection': f"{server_url}/static/{detection_result.get('visualization')}" if detection_result.get(
+                    'visualization') else None,
                 'nutrition': f"{server_url}/static/{visualization.get('nutrition_image')}" if visualization else None,
                 'chart': f"{server_url}/static/{visualization.get('chart_image')}" if visualization else None
             }
@@ -788,11 +790,47 @@ def api_analyze():
 # Initialize app function - load models outside if __name__ block for cloud environments
 def initialize_app():
     global model, nutrition_data
-    print("Loading weight prediction model...")
-    model = load_model(MODEL_PATH, MODEL_INFO_PATH, device)
 
-    print("Loading nutritional database...")
-    nutrition_data = load_nutritional_data(NUTRITION_DATA_PATH)
+    # Create directories if they don't exist
+    os.makedirs('model_output', exist_ok=True)
+
+    # Define model paths - use environment variables if available
+    model_path = os.environ.get('MODEL_PATH', MODEL_PATH)
+    model_info_path = os.environ.get('MODEL_INFO_PATH', MODEL_INFO_PATH)
+    nutrition_data_path = os.environ.get('NUTRITION_DATA_PATH', NUTRITION_DATA_PATH)
+
+    # Check if models exist locally, if not download from S3
+    if not os.path.exists(model_path) or not os.path.exists(model_info_path) or not os.path.exists(nutrition_data_path):
+        try:
+            print("Models not found locally. Attempting to download from S3...")
+            # Create S3 client
+            s3 = boto3.client('s3')
+
+            # Create directories if they don't exist
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            os.makedirs(os.path.dirname(model_info_path), exist_ok=True)
+            os.makedirs(os.path.dirname(nutrition_data_path), exist_ok=True)
+
+            # Download models from S3
+            s3.download_file('snapsilog-models', 'best_weight_model.pth', model_path)
+            s3.download_file('snapsilog-models', 'model_info.json', model_info_path)
+            s3.download_file('snapsilog-models', 'nutritional_database.json', nutrition_data_path)
+            print("Models downloaded successfully from S3")
+        except Exception as e:
+            print(f"Error downloading models from S3: {str(e)}")
+            # Fallback to original paths if S3 download fails
+            model_path = MODEL_PATH
+            model_info_path = MODEL_INFO_PATH
+            nutrition_data_path = NUTRITION_DATA_PATH
+            print(f"Falling back to local model paths")
+
+    print(f"Loading weight prediction model from {model_path}...")
+    model = load_model(model_path, model_info_path, device)
+
+    print(f"Loading nutritional database from {nutrition_data_path}...")
+    nutrition_data = load_nutritional_data(nutrition_data_path)
+
+    print("Initialization complete!")
 
 
 # Initialize on import
