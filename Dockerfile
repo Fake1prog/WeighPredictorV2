@@ -1,11 +1,14 @@
-FROM python:3.12-slim
+FROM python:3.12
 
 WORKDIR /app
 
-# Install system dependencies for OpenCV
+# Install system dependencies for OpenCV and build tools
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    gcc \
+    g++ \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
