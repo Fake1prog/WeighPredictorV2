@@ -70,13 +70,10 @@ def load_model(model_path, model_info_path, device):
 
     print(f"Creating model with {num_components} components")
 
-    # The issue is likely that you trained with a different number of components
-    # than what's in your current info file. Let's hardcode the model architecture
-    # to match exactly what was used during training.
+    # Initialize the model with default parameters first
+    model = FoodWeightCNN(num_components=num_components, use_manual_features=True)
 
-    model = FoodWeightCNN(num_components=7, use_manual_features=True)
-
-    # Now load the weights
+    # Try to load the model weights
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
         print("Model loaded successfully")
@@ -84,26 +81,31 @@ def load_model(model_path, model_info_path, device):
         # If there's a mismatch, print details and try to fix it
         print(f"Error loading model: {str(e)}")
 
-        # This is a fallback approach - we'll rebuild the model with a hardcoded architecture
+        # This is a fallback approach - we'll rebuild the model with an architecture
         # that matches what was used during training
         print("Trying alternate model configuration...")
+
+        # Create a new model with the exact architecture from the saved model
+        model = FoodWeightCNN(num_components=num_components, use_manual_features=False)
 
         # Image feature extraction
         img_features = 64
         mask_features = 32
         comp_features = 16
-        manual_features = 0  # Try without manual features
+        manual_features = 0  # No manual features in the saved model
 
         total_features = img_features + mask_features + comp_features + manual_features
 
-        # Recreate the regressor with the expected size from training
+        # Create the regressor with the exact structure from the saved model (with batch normalization)
         model.regressor = nn.Sequential(
             nn.Linear(total_features, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.Dropout(0.3),
             nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.15),
             nn.Linear(32, 1)
         )
 
@@ -111,8 +113,38 @@ def load_model(model_path, model_info_path, device):
         model.use_manual_features = False
 
         # Try loading again
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print("Model loaded successfully with modified architecture")
+        try:
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print("Model loaded successfully with modified architecture")
+        except RuntimeError as e:
+            # If still failing, try one more approach with direct structure from train_weight_model.py
+            print(f"Still having issues loading the model: {str(e)}")
+            print("Trying final fallback configuration...")
+
+            # Creating a model with the exact configuration from train_weight_model.py
+            model = FoodWeightCNN(num_components=num_components, use_manual_features=False)
+
+            # Explicitly setting the input feature size to match what's in the checkpoint (112)
+            total_features = 112
+
+            # Recreate the regressor with exactly the same structure as in the checkpoint
+            model.regressor = nn.Sequential(
+                nn.Linear(total_features, 64),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, 32),
+                nn.BatchNorm1d(32),
+                nn.ReLU(),
+                nn.Dropout(0.15),
+                nn.Linear(32, 1)
+            )
+
+            model.use_manual_features = False
+
+            # Final attempt to load
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print("Model loaded successfully with final fallback configuration")
 
     model.to(device)
     model.eval()
@@ -490,7 +522,7 @@ def predict_weights(detection_result, model, device, image_path):
                 print(f"Available components: {model.component_types}")
                 continue
 
-            # Prepare mask tensor - use mask_transform instead of the same transform as image
+            # Prepare mask tensor
             mask = component_data['mask']
             mask_pil = Image.fromarray(mask).convert('L')
             mask_tensor = mask_transform(mask_pil).unsqueeze(0).to(device)
@@ -514,9 +546,14 @@ def predict_weights(detection_result, model, device, image_path):
 
             # Predict weight - handle different model configurations
             with torch.no_grad():
-                if model.use_manual_features:
-                    weight = model(image_tensor, mask_tensor, component_tensor, manual_features).item()
-                else:
+                try:
+                    if model.use_manual_features:
+                        weight = model(image_tensor, mask_tensor, component_tensor, manual_features).item()
+                    else:
+                        weight = model(image_tensor, mask_tensor, component_tensor).item()
+                except Exception as e:
+                    print(f"Error during prediction, trying alternate configuration: {str(e)}")
+                    # If the model raises an error, try the alternate configuration
                     weight = model(image_tensor, mask_tensor, component_tensor).item()
 
             # Store prediction
