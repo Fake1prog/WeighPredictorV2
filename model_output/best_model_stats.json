@@ -1,0 +1,9 @@
+{
+  "val_loss": 30.54636759440104,
+  "val_mae": 4.11338472366333,
+  "val_mape": 5.032332897186279,
+  "val_rmse": 5.526876926422119,
+  "training_time_seconds": 9032.748519897461,
+  "epochs_trained": 79,
+  "early_stopped": true
+}

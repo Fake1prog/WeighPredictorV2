@@ -1,0 +1,17 @@
+{
+  "dataset_index": "processed_dataset/dataset_index.json",
+  "image_dir": ".",
+  "processed_dir": "processed_dataset",
+  "output_dir": "model_outputV2",
+  "component_type": null,
+  "batch_size": 16,
+  "epochs": 100,
+  "patience": 15,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "dropout": 0.3,
+  "seed": 42,
+  "use_manual_features": false,
+  "skip_training": false,
+  "device": ""
+}

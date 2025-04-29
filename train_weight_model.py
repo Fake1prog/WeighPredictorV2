@@ -12,18 +12,21 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import argparse
 from sklearn.model_selection import train_test_split
+import time
+from datetime import datetime
 
 
 class FoodComponentDataset(Dataset):
     """Dataset for training food component weight prediction model."""
 
-    def __init__(self, dataset_index, image_dir, processed_dir, component_type=None):
+    def __init__(self, dataset_index, image_dir, processed_dir, component_type=None, transform_mode='train'):
         """
         Args:
             dataset_index: Path to dataset index JSON file or loaded dataset
             image_dir: Directory containing original food images
             processed_dir: Directory containing processed masks
             component_type: If specified, only load this component type (e.g., 'egg')
+            transform_mode: 'train' for training augmentations, 'val' for validation
         """
         if isinstance(dataset_index, str):
             # Load dataset index from file
@@ -36,18 +39,41 @@ class FoodComponentDataset(Dataset):
         self.image_dir = image_dir
         self.processed_dir = processed_dir
         self.component_type = component_type
+        self.transform_mode = transform_mode
 
-        # Define separate transforms for images and masks
-        self.image_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        # Define separate transforms for images and masks based on mode
+        if transform_mode == 'train':
+            # More aggressive augmentation for training
+            self.image_transform = transforms.Compose([
+                transforms.Resize((256, 256)),  # Resize larger for random crop
+                transforms.RandomCrop((224, 224)),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.RandomErasing(p=0.2, scale=(0.02, 0.1))
+            ])
 
-        self.mask_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor()
-        ])
+            self.mask_transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.RandomCrop((224, 224)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ToTensor()
+            ])
+        else:
+            # Simple transformation for validation
+            self.image_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+
+            self.mask_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor()
+            ])
 
         # Create samples list
         self.samples = []
@@ -115,8 +141,81 @@ class FoodComponentDataset(Dataset):
         self.component_types = sorted(list(set(sample['component'] for sample in self.samples)))
         self.component_to_idx = {comp: idx for idx, comp in enumerate(self.component_types)}
 
+        # Calculate normalization factors for manual features
+        self.calculate_feature_stats()
+
+    def calculate_feature_stats(self):
+        """Calculate mean and std for manual features to improve normalization."""
+        areas = [s['features']['area'] for s in self.samples if s['features']['area'] > 0]
+        widths = [s['features']['width'] for s in self.samples if s['features']['width'] > 0]
+        heights = [s['features']['height'] for s in self.samples if s['features']['height'] > 0]
+
+        # Calculate statistics for feature normalization
+        self.area_mean = np.mean(areas) if areas else 50000
+        self.area_std = np.std(areas) if areas else 10000
+        self.width_mean = np.mean(widths) if widths else 500
+        self.width_std = np.std(widths) if widths else 100
+        self.height_mean = np.mean(heights) if heights else 500
+        self.height_std = np.std(heights) if heights else 100
+
+        print(f"Feature statistics - Area: mean={self.area_mean:.1f}, std={self.area_std:.1f}")
+        print(f"Feature statistics - Width: mean={self.width_mean:.1f}, std={self.width_std:.1f}")
+        print(f"Feature statistics - Height: mean={self.height_mean:.1f}, std={self.height_std:.1f}")
+
     def __len__(self):
         return len(self.samples)
+
+    def normalize_features(self, features):
+        """Normalize features using z-score normalization with dataset statistics."""
+        normalized = features.clone()
+
+        # Z-score normalization (if area > 0)
+        if features[0] > 0:
+            normalized[0] = (features[0] - self.area_mean) / self.area_std
+            normalized[1] = (features[1] - self.width_mean) / self.width_std
+            normalized[2] = (features[2] - self.height_mean) / self.height_std
+
+        return normalized
+
+    def synchronized_transforms(self, image, mask):
+        """Apply the same random transformations to both image and mask."""
+        # Only for validation or when we want deterministic transforms
+        if self.transform_mode != 'train':
+            return self.image_transform(image), self.mask_transform(mask)
+
+        # For training with synchronized transforms
+        # First resize both to the same size
+        image = transforms.Resize((256, 256))(image)
+        mask = transforms.Resize((256, 256))(mask)
+
+        # Generate random transformation parameters
+        i, j, h, w = transforms.RandomCrop.get_params(image, output_size=(224, 224))
+        flip = torch.rand(1) < 0.5
+        angle = transforms.RandomRotation.get_params([-10, 10])
+
+        # Apply the same transformations in sequence
+        # 1. Random crop
+        image = transforms.functional.crop(image, i, j, h, w)
+        mask = transforms.functional.crop(mask, i, j, h, w)
+
+        # 2. Random horizontal flip
+        if flip:
+            image = transforms.functional.hflip(image)
+            mask = transforms.functional.hflip(mask)
+
+        # 3. Random rotation
+        image = transforms.functional.rotate(image, angle)
+        mask = transforms.functional.rotate(mask, angle)
+
+        # 4. Image-specific transforms
+        image = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2)(image)
+        image = transforms.ToTensor()(image)
+        image = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image)
+
+        # 5. Mask-specific transforms
+        mask = transforms.ToTensor()(mask)
+
+        return image, mask
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -127,9 +226,8 @@ class FoodComponentDataset(Dataset):
         # Load mask
         mask = Image.open(sample['mask_path']).convert('L')
 
-        # Apply transformations - use separate transforms for image and mask
-        image = self.image_transform(image)
-        mask = self.mask_transform(mask)
+        # Apply transformations with synchronized random parameters
+        image, mask = self.synchronized_transforms(image, mask)
 
         # Create one-hot encoding for component type
         component_idx = self.component_to_idx[sample['component']]
@@ -145,61 +243,63 @@ class FoodComponentDataset(Dataset):
             sample['features']['confidence']
         ], dtype=torch.float32)
 
-        # Normalize manual features (simple scaling for now)
-        if manual_features[0] > 0:  # Skip if area is zero
-            # Normalize area by typical mask area
-            manual_features[0] = manual_features[0] / 50000  # Typical mask might be around 50k pixels
-
-            # Normalize width and height by typical dimensions
-            manual_features[1] = manual_features[1] / 500  # Width normalization
-            manual_features[2] = manual_features[2] / 500  # Height normalization
+        # Normalize manual features using dataset statistics
+        manual_features = self.normalize_features(manual_features)
 
         return {
             'image': image,
             'mask': mask,
             'component_type': component_onehot,
             'manual_features': manual_features,
-            'weight': torch.tensor(sample['weight'], dtype=torch.float32)
+            'weight': torch.tensor(sample['weight'], dtype=torch.float32),
+            'component_name': sample['component']  # Add component name for analysis
         }
 
 
 class FoodWeightCNN(nn.Module):
     """CNN model for predicting food component weights."""
 
-    def __init__(self, num_components, use_manual_features=True):
+    def __init__(self, num_components, use_manual_features=True, dropout_rate=0.3):
         """
         Args:
             num_components: Number of different food component types
             use_manual_features: Whether to use hand-crafted features
+            dropout_rate: Dropout rate for regularization
         """
         super(FoodWeightCNN, self).__init__()
 
-        # Image feature extraction
+        # Image feature extraction with batch normalization
         self.image_features = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
+            nn.Dropout2d(dropout_rate)
         )
 
-        # Mask feature extraction
+        # Mask feature extraction with batch normalization
         self.mask_features = nn.Sequential(
             nn.Conv2d(1, 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(8),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
+            nn.Dropout2d(dropout_rate)
         )
 
         # Global average pooling to reduce feature maps
@@ -208,7 +308,9 @@ class FoodWeightCNN(nn.Module):
         # Component type embedding
         self.component_embedding = nn.Sequential(
             nn.Linear(num_components, 16),
-            nn.ReLU()
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate / 2)  # Less dropout for this smaller network
         )
 
         # Number of features after pooling
@@ -219,18 +321,33 @@ class FoodWeightCNN(nn.Module):
 
         total_features = img_features + mask_features + comp_features + manual_features
 
-        # Regression head
+        # Regression head with batch normalization
         self.regressor = nn.Sequential(
             nn.Linear(total_features, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.Dropout(dropout_rate),
             nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(dropout_rate / 2),
             nn.Linear(32, 1)
         )
 
         self.use_manual_features = use_manual_features
+
+        # Initialize weights properly
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        """Initialize model weights for better convergence."""
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
 
     def forward(self, image, mask, component_type, manual_features=None):
         # Extract image features
@@ -255,12 +372,51 @@ class FoodWeightCNN(nn.Module):
         return weight.squeeze()
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device):
-    """Train for one epoch."""
+class EarlyStopping:
+    """Early stopping to prevent overfitting"""
+
+    def __init__(self, patience=7, min_delta=0, verbose=True, path='checkpoint.pt'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = float('inf')
+        self.path = path
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        '''Save model when validation loss decreases.'''
+        if self.verbose:
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
+        torch.save(model.state_dict(), self.path)
+        self.val_loss_min = val_loss
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device, clip_value=1.0):
+    """Train for one epoch with gradient clipping."""
     model.train()
     total_loss = 0.0
+    progress_bar = tqdm(train_loader, desc="Training")
 
-    for batch in tqdm(train_loader, desc="Training"):
+    for batch in progress_bar:
         # Get data
         images = batch['image'].to(device)
         masks = batch['mask'].to(device)
@@ -273,11 +429,15 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         outputs = model(images, masks, component_types, manual_features)
         loss = criterion(outputs, weights)
 
-        # Backward pass
+        # Backward pass with gradient clipping
         loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), clip_value)
         optimizer.step()
 
         total_loss += loss.item() * images.size(0)
+
+        # Update progress bar with current loss
+        progress_bar.set_postfix({'batch_loss': loss.item()})
 
     return total_loss / len(train_loader.dataset)
 
@@ -288,6 +448,7 @@ def validate(model, val_loader, criterion, device):
     total_loss = 0.0
     predictions = []
     ground_truths = []
+    component_names = []
 
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validating"):
@@ -307,6 +468,7 @@ def validate(model, val_loader, criterion, device):
             # Store predictions and ground truths for metrics
             predictions.extend(outputs.cpu().numpy())
             ground_truths.extend(weights.cpu().numpy())
+            component_names.extend(batch['component_name'])
 
     # Calculate metrics
     predictions = np.array(predictions)
@@ -315,53 +477,76 @@ def validate(model, val_loader, criterion, device):
     # Mean Absolute Error
     mae = np.mean(np.abs(predictions - ground_truths))
 
-    # Mean Absolute Percentage Error
-    mape = np.mean(np.abs((predictions - ground_truths) / ground_truths)) * 100
+    # Mean Absolute Percentage Error (handle division by zero)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mapes = np.abs((predictions - ground_truths) / ground_truths) * 100
+    mape = np.mean(mapes[~np.isnan(mapes) & ~np.isinf(mapes)])
 
     # Root Mean Squared Error
     rmse = np.sqrt(np.mean((predictions - ground_truths) ** 2))
 
-    return total_loss / len(val_loader.dataset), mae, mape, rmse, predictions, ground_truths
+    return total_loss / len(val_loader.dataset), mae, mape, rmse, predictions, ground_truths, component_names
 
 
 def plot_training_results(history, output_dir):
-    """Plot training and validation loss."""
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Training Loss')
-    plt.plot(history['val_loss'], label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
+    """Plot training and validation loss with improved visualization."""
+    # Create directory for plots
+    plots_dir = os.path.join(output_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
 
+    # Set plot style for better visualization
+    plt.style.use('seaborn-v0_8-darkgrid')
+
+    # Plot training and validation loss
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    epochs = range(1, len(history['train_loss']) + 1)
+    plt.plot(epochs, history['train_loss'], 'b-', linewidth=2, label='Training Loss')
+    plt.plot(epochs, history['val_loss'], 'r-', linewidth=2, label='Validation Loss')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss (MSE)', fontsize=12)
+    plt.title('Training and Validation Loss', fontsize=14)
+    plt.legend(fontsize=12)
+    plt.grid(True)
+
+    # Plot validation metrics
     plt.subplot(1, 2, 2)
-    plt.plot(history['val_mae'], label='MAE')
-    plt.plot(history['val_rmse'], label='RMSE')
-    plt.xlabel('Epoch')
-    plt.ylabel('Error (grams)')
-    plt.title('Validation Metrics')
-    plt.legend()
+    plt.plot(epochs, history['val_mae'], 'g-', linewidth=2, label='MAE (grams)')
+    plt.plot(epochs, history['val_rmse'], 'm-', linewidth=2, label='RMSE (grams)')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Error (grams)', fontsize=12)
+    plt.title('Validation Metrics', fontsize=14)
+    plt.legend(fontsize=12)
+    plt.grid(True)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_history.png'))
+    plt.savefig(os.path.join(plots_dir, 'training_history.png'), dpi=300)
     plt.close()
 
-    # Plot prediction vs. ground truth for last epoch
+    # Plot prediction vs. ground truth scatter plot for last epoch
     plt.figure(figsize=(10, 8))
-    plt.scatter(history['ground_truths'][-1], history['predictions'][-1], alpha=0.5)
+    plt.scatter(history['ground_truths'][-1], history['predictions'][-1],
+                alpha=0.6, c='blue', edgecolors='k', s=60)
 
     # Add perfect prediction line
     min_val = min(min(history['ground_truths'][-1]), min(history['predictions'][-1]))
     max_val = max(max(history['ground_truths'][-1]), max(history['predictions'][-1]))
-    plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
 
-    plt.xlabel('Ground Truth (grams)')
-    plt.ylabel('Prediction (grams)')
-    plt.title(f'Prediction vs. Ground Truth (MAE: {history["val_mae"][-1]:.2f}g, MAPE: {history["val_mape"][-1]:.2f}%)')
+    # Calculate R² for the plot
+    correlation_matrix = np.corrcoef(history['ground_truths'][-1], history['predictions'][-1])
+    correlation_xy = correlation_matrix[0, 1]
+    r_squared = correlation_xy ** 2
+
+    plt.xlabel('Ground Truth (grams)', fontsize=12)
+    plt.ylabel('Prediction (grams)', fontsize=12)
+    plt.title(
+        f'Prediction vs. Ground Truth\nMAE: {history["val_mae"][-1]:.2f}g, MAPE: {history["val_mape"][-1]:.2f}%, R²: {r_squared:.3f}',
+        fontsize=14)
+    plt.grid(True, alpha=0.3)
     plt.axis('equal')
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'prediction_vs_truth.png'))
+    plt.savefig(os.path.join(plots_dir, 'prediction_vs_truth.png'), dpi=300)
     plt.close()
 
     # Plot component-specific results if available
@@ -382,24 +567,34 @@ def plot_training_results(history, output_dir):
             truth = component_ground_truths[component]
 
             if len(pred) > 0:
-                plt.scatter(truth, pred, alpha=0.5)
+                plt.scatter(truth, pred, alpha=0.6, c='blue', edgecolors='k', s=50)
 
                 # Add perfect prediction line
                 min_val = min(min(truth), min(pred))
                 max_val = max(max(truth), max(pred))
-                plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+                plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
 
                 # Add component specific metrics
                 mae = np.mean(np.abs(np.array(pred) - np.array(truth)))
-                mape = np.mean(np.abs((np.array(pred) - np.array(truth)) / np.array(truth))) * 100
 
-                plt.title(f'{component.capitalize()} (MAE: {mae:.2f}g, MAPE: {mape:.2f}%)')
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    mape_values = np.abs((np.array(pred) - np.array(truth)) / np.array(truth)) * 100
+                mape = np.mean(mape_values[~np.isnan(mape_values) & ~np.isinf(mape_values)])
+
+                # Calculate R² for component
+                if len(truth) > 1:  # Need at least 2 points for correlation
+                    r_squared_comp = np.corrcoef(truth, pred)[0, 1] ** 2
+                    plt.title(f'{component.capitalize()}\nMAE: {mae:.2f}g, MAPE: {mape:.2f}%, R²: {r_squared_comp:.3f}')
+                else:
+                    plt.title(f'{component.capitalize()}\nMAE: {mae:.2f}g, MAPE: {mape:.2f}%')
+
                 plt.xlabel('Ground Truth (g)')
                 plt.ylabel('Prediction (g)')
+                plt.grid(True, alpha=0.3)
                 plt.axis('equal')
 
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'prediction_by_component.png'))
+        plt.savefig(os.path.join(plots_dir, 'prediction_by_component.png'), dpi=300)
         plt.close()
 
 
@@ -433,7 +628,9 @@ def export_model(model, num_components, output_dir):
             'mask': [1, 1, 224, 224],
             'component_type': [1, num_components],
             'manual_features': [1, 5]
-        }
+        },
+        'model_version': 'v2',
+        'export_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
     with open(os.path.join(output_dir, 'model_info.json'), 'w') as f:
@@ -472,13 +669,25 @@ def generate_history_and_plots(model, dataset, val_dataset, output_dir, device):
     )
 
     # Validate model
-    val_loss, val_mae, val_mape, val_rmse, predictions, ground_truths = validate(
+    val_loss, val_mae, val_mape, val_rmse, predictions, ground_truths, component_names = validate(
         model, val_loader, criterion, device
     )
 
     # Print metrics
     print(f"Val Loss: {val_loss:.4f}")
     print(f"Val MAE: {val_mae:.2f}g, Val MAPE: {val_mape:.2f}%, Val RMSE: {val_rmse:.2f}g")
+
+    # Get component-specific results
+    component_pred_dict = {}
+    component_truth_dict = {}
+
+    for pred, truth, comp_name in zip(predictions, ground_truths, component_names):
+        if comp_name not in component_pred_dict:
+            component_pred_dict[comp_name] = []
+            component_truth_dict[comp_name] = []
+
+        component_pred_dict[comp_name].append(float(pred))
+        component_truth_dict[comp_name].append(float(truth))
 
     # Create history dictionary with single entry
     history = {
@@ -489,40 +698,14 @@ def generate_history_and_plots(model, dataset, val_dataset, output_dir, device):
         'val_rmse': [float(val_rmse)],
         'predictions': [[float(p) for p in predictions.tolist()]],
         'ground_truths': [[float(g) for g in ground_truths.tolist()]],
+        'component_predictions': [component_pred_dict],
+        'component_ground_truths': [component_truth_dict],
         'component_names': dataset.component_types
     }
 
-    # Get per-component predictions
-    component_predictions = {comp: [] for comp in dataset.component_types}
-    component_ground_truths = {comp: [] for comp in dataset.component_types}
-
-    model.eval()
-    with torch.no_grad():
-        for i in range(len(val_dataset)):
-            sample = val_dataset[i]
-            img = sample['image'].unsqueeze(0).to(device)
-            mask = sample['mask'].unsqueeze(0).to(device)
-            comp_type = sample['component_type'].unsqueeze(0).to(device)
-            features = sample['manual_features'].unsqueeze(0).to(device)
-            weight = sample['weight'].item()
-
-            # Get component name from one-hot
-            comp_idx = torch.argmax(sample['component_type']).item()
-            comp_name = dataset.component_types[comp_idx]
-
-            # Forward pass
-            output = model(img, mask, comp_type, features).item()
-
-            # Store by component
-            component_predictions[comp_name].append(float(output))
-            component_ground_truths[comp_name].append(float(weight))
-
-    history['component_predictions'] = [component_predictions]
-    history['component_ground_truths'] = [component_ground_truths]
-
     # Save history
     serializable_history = convert_numpy_types(history)
-    with open(os.path.join(output_dir, 'training_history.json'), 'w') as f:
+    with open(os.path.join(output_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(serializable_history, f, indent=2)
 
     # Plot results
@@ -532,83 +715,121 @@ def generate_history_and_plots(model, dataset, val_dataset, output_dir, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train food component weight prediction model')
+    parser = argparse.ArgumentParser(description='Train food component weight prediction model (V2)')
     parser.add_argument('--dataset_index', type=str, default='processed_dataset/dataset_index.json',
                         help='Path to dataset index JSON file')
     parser.add_argument('--image_dir', type=str, default='.',
                         help='Directory containing original images')
     parser.add_argument('--processed_dir', type=str, default='processed_dataset',
                         help='Directory containing processed masks')
-    parser.add_argument('--output_dir', type=str, default='model_output',
+    parser.add_argument('--output_dir', type=str, default='model_outputV2',
                         help='Directory to save model and results')
     parser.add_argument('--component_type', type=str, default=None,
                         help='Train for specific component type (default: all components)')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Number of epochs to train')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Maximum number of epochs to train')
+    parser.add_argument('--patience', type=int, default=15,
+                        help='Patience for early stopping')
     parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
+                        help='Initial learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                        help='Weight decay (L2 penalty)')
+    parser.add_argument('--dropout', type=float, default=0.3,
+                        help='Dropout rate')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--use_manual_features', action='store_true',
                         help='Use manual features (area, width, etc.)')
     parser.add_argument('--skip_training', action='store_true',
                         help='Skip training if model exists and just generate plots')
+    parser.add_argument('--device', type=str, default='',
+                        help='Device to use (cuda or cpu, default: auto-detect)')
 
     args = parser.parse_args()
 
-    # Set random seed
+    # Set random seed for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-    # Create output directory
+    # Create output directory with subdirectories
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, 'checkpoints'), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, 'plots'), exist_ok=True)
 
     # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # Save arguments for reference
+    with open(os.path.join(args.output_dir, 'training_args.json'), 'w') as f:
+        json.dump(vars(args), f, indent=2)
+
     # Load dataset
-    dataset = FoodComponentDataset(
+    print("Loading dataset...")
+    full_dataset = FoodComponentDataset(
         args.dataset_index,
         args.image_dir,
         args.processed_dir,
-        component_type=args.component_type
+        component_type=args.component_type,
+        transform_mode='train'  # Initially set to train mode
     )
 
     # Split into train/validation sets
     train_indices, val_indices = train_test_split(
-        range(len(dataset)),
+        range(len(full_dataset)),
         test_size=0.2,
-        random_state=args.seed
+        random_state=args.seed,
+        shuffle=True
     )
 
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+    # Create train dataset with augmentations
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+
+    # Create validation dataset with separate instance using validation transforms
+    val_full_dataset = FoodComponentDataset(
+        args.dataset_index,
+        args.image_dir,
+        args.processed_dir,
+        component_type=args.component_type,
+        transform_mode='val'  # Validation mode with no augmentations
+    )
+    val_dataset = torch.utils.data.Subset(val_full_dataset, val_indices)
+
+    print(f"Train set: {len(train_dataset)} samples")
+    print(f"Validation set: {len(val_dataset)} samples")
 
     # Initialize model
-    num_components = len(dataset.component_types)
+    num_components = len(full_dataset.component_types)
     model = FoodWeightCNN(
         num_components=num_components,
-        use_manual_features=args.use_manual_features
+        use_manual_features=args.use_manual_features,
+        dropout_rate=args.dropout
     )
 
     # Save component types to model for reference
-    model.component_types = dataset.component_types
-    model.component_to_idx = dataset.component_to_idx
+    model.component_types = full_dataset.component_types
+    model.component_to_idx = full_dataset.component_to_idx
 
     # Check if we should skip training
-    model_path = os.path.join(args.output_dir, 'best_weight_model.pth')
+    model_path = os.path.join(args.output_dir, 'checkpoints', 'best_weight_model.pth')
     if os.path.exists(model_path) and args.skip_training:
         print(f"Found existing model at {model_path}, skipping training.")
 
         # Load the existing model
-        model.load_state_dict(torch.load(model_path))
+        model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
 
         # Generate history and plots
-        generate_history_and_plots(model, dataset, val_dataset, args.output_dir, device)
+        generate_history_and_plots(model, full_dataset, val_dataset, args.output_dir, device)
 
         print("Analysis completed!")
         return
@@ -626,21 +847,39 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4
+        num_workers=4,
+        pin_memory=True if device.type == 'cuda' else False
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4
+        num_workers=4,
+        pin_memory=True if device.type == 'cuda' else False
     )
 
-    # Loss function and optimizer
+    # Loss function and optimizer with weight decay for L2 regularization
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+
+    # Learning rate scheduler - cosine annealing with warm restarts
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=10,  # Restart every 10 epochs
+        T_mult=2,  # Double the restart period after each restart
+        eta_min=1e-6  # Minimum learning rate
+    )
+
+    # Early stopping
+    early_stopping = EarlyStopping(
+        patience=args.patience,
+        verbose=True,
+        path=os.path.join(args.output_dir, 'checkpoints', 'best_weight_model.pth')
     )
 
     # Training history
@@ -654,14 +893,19 @@ def main():
         'ground_truths': [],
         'component_predictions': [],
         'component_ground_truths': [],
-        'component_names': dataset.component_types
+        'component_names': full_dataset.component_types,
+        'learning_rates': []
     }
 
+    # Start time for training
+    start_time = time.time()
+
     # Training loop
-    best_val_loss = float('inf')
+    print(f"Starting training for up to {args.epochs} epochs...")
 
     for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\nEpoch {epoch + 1}/{args.epochs} (LR: {current_lr:.6f})")
 
         # Train
         train_loss = train_one_epoch(
@@ -669,16 +913,24 @@ def main():
         )
 
         # Validate
-        val_loss, val_mae, val_mape, val_rmse, predictions, ground_truths = validate(
+        val_loss, val_mae, val_mape, val_rmse, predictions, ground_truths, component_names = validate(
             model, val_loader, criterion, device
         )
 
-        # Update scheduler
-        scheduler.step(val_loss)
+        # Update learning rate
+        scheduler.step()
+
+        # Current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        history['learning_rates'].append(current_lr)
 
         # Print metrics
-        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         print(f"Val MAE: {val_mae:.2f}g, Val MAPE: {val_mape:.2f}%, Val RMSE: {val_rmse:.2f}g")
+
+        # Calculate elapsed time
+        elapsed_time = time.time() - start_time
+        print(f"Time elapsed: {elapsed_time:.1f} seconds")
 
         # Save history - convert numpy values to Python native types
         history['train_loss'].append(float(train_loss))
@@ -692,53 +944,77 @@ def main():
         history['ground_truths'].append([float(g) for g in ground_truths.tolist()])
 
         # Get per-component predictions
-        component_predictions = {comp: [] for comp in dataset.component_types}
-        component_ground_truths = {comp: [] for comp in dataset.component_types}
+        component_predictions = {comp: [] for comp in full_dataset.component_types}
+        component_ground_truths = {comp: [] for comp in full_dataset.component_types}
 
-        model.eval()
-        with torch.no_grad():
-            for i in range(len(val_dataset)):
-                sample = val_dataset[i]
-                img = sample['image'].unsqueeze(0).to(device)
-                mask = sample['mask'].unsqueeze(0).to(device)
-                comp_type = sample['component_type'].unsqueeze(0).to(device)
-                features = sample['manual_features'].unsqueeze(0).to(device)
-                weight = sample['weight'].item()
-
-                # Get component name from one-hot
-                comp_idx = torch.argmax(sample['component_type']).item()
-                comp_name = dataset.component_types[comp_idx]
-
-                # Forward pass
-                output = model(img, mask, comp_type, features).item()
-
-                # Store by component - ensure these are native Python floats
-                component_predictions[comp_name].append(float(output))
-                component_ground_truths[comp_name].append(float(weight))
+        # Group predictions by component
+        for pred, truth, comp_name in zip(predictions, ground_truths, component_names):
+            component_predictions[comp_name].append(float(pred))
+            component_ground_truths[comp_name].append(float(truth))
 
         history['component_predictions'].append(component_predictions)
         history['component_ground_truths'].append(component_ground_truths)
 
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), os.path.join(args.output_dir, 'best_weight_model.pth'))
-            print(f"Saved best model with Val Loss: {val_loss:.4f}")
+        # Save intermediate history and plots every 5 epochs
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            # Convert any remaining numpy types before saving
+            serializable_history = convert_numpy_types(history)
 
-            # Export model for mobile
-            export_model(model, num_components, args.output_dir)
+            # Save training history
+            with open(os.path.join(args.output_dir, 'training_history.json'), 'w') as f:
+                json.dump(serializable_history, f, indent=2)
 
-    # Convert any remaining numpy types before saving
+            # Plot intermediate results
+            plot_training_results(history, args.output_dir)
+
+        # Check early stopping
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            print(f"Early stopping triggered after {epoch + 1} epochs!")
+            break
+
+    # End time for training
+    end_time = time.time()
+    training_time = end_time - start_time
+    print(f"Training completed in {training_time:.2f} seconds ({training_time / 60:.2f} minutes)!")
+
+    # Load the best model
+    model.load_state_dict(torch.load(os.path.join(args.output_dir, 'checkpoints', 'best_weight_model.pth')))
+
+    # Final evaluation with the best model
+    print("Performing final evaluation with best model...")
+    val_loss, val_mae, val_mape, val_rmse, predictions, ground_truths, component_names = validate(
+        model, val_loader, criterion, device
+    )
+
+    print(f"Best model - Val Loss: {val_loss:.6f}")
+    print(f"Best model - Val MAE: {val_mae:.2f}g, Val MAPE: {val_mape:.2f}%, Val RMSE: {val_rmse:.2f}g")
+
+    # Save best model statistics
+    best_model_stats = {
+        'val_loss': float(val_loss),
+        'val_mae': float(val_mae),
+        'val_mape': float(val_mape),
+        'val_rmse': float(val_rmse),
+        'training_time_seconds': training_time,
+        'epochs_trained': len(history['train_loss']),
+        'early_stopped': len(history['train_loss']) < args.epochs
+    }
+
+    with open(os.path.join(args.output_dir, 'best_model_stats.json'), 'w') as f:
+        json.dump(best_model_stats, f, indent=2)
+
+    # Export model for mobile
+    export_model(model, num_components, args.output_dir)
+
+    # Save final history and plots
     serializable_history = convert_numpy_types(history)
-
-    # Save training history
     with open(os.path.join(args.output_dir, 'training_history.json'), 'w') as f:
-        json.dump(serializable_history, f)
+        json.dump(serializable_history, f, indent=2)
 
-    # Plot training results
     plot_training_results(history, args.output_dir)
 
-    print("Training completed!")
+    print("Training and analysis completed!")
 
 
 if __name__ == "__main__":
